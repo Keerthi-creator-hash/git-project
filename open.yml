@@ -1,0 +1,393 @@
+name: Monthly OpenWiki Product Documentation Update
+
+on:
+  workflow_dispatch:
+
+  # First day of every month at 5:00 PM IST
+  schedule:
+    - cron: "0 17 1 * *"
+      timezone: "Asia/Kolkata"
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: openwiki-documentation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  update-openwiki:
+    runs-on: ubuntu-latest
+
+    env:
+      OPENWIKI_PROVIDER: bedrock
+
+      BEDROCK_AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+
+      OPENWIKI_MODEL_ID: au.anthropic.claude-sonnet-4-6
+
+      OPENWIKI_MAX_OUTPUT_TOKENS: 16000
+
+    steps:
+
+      # ==================================================
+      # 1. Checkout centrim-documentation
+      # ==================================================
+      - name: Checkout documentation repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # ==================================================
+      # 2. Checkout latest centrim_api documentation
+      #
+      # Manual run from openwiki-OIDC:
+      #   reads openwiki-OIDC from API.
+      #
+      # Scheduled run from main:
+      #   reads main from API.
+      # ==================================================
+      - name: Checkout centrim_api
+        uses: actions/checkout@v6
+        with:
+          repository: Centrim-Life-Pty-Ltd/centrim_api
+          token: ${{ secrets.GH_TOKEN }}
+          ref: ${{ github.ref_name }}
+          path: source-repos/centrim_api
+          fetch-depth: 1
+          persist-credentials: false
+
+      # ==================================================
+      # 3. Checkout latest centrim_life documentation
+      # ==================================================
+      - name: Checkout centrim_life
+        uses: actions/checkout@v6
+        with:
+          repository: Centrim-Life-Pty-Ltd/centrim_life
+          token: ${{ secrets.GH_TOKEN }}
+          ref: ${{ github.ref_name }}
+          path: source-repos/centrim_life
+          fetch-depth: 1
+          persist-credentials: false
+
+      # ==================================================
+      # 4. Synchronize latest API OpenWiki documentation
+      # ==================================================
+      - name: Sync API documentation
+        shell: bash
+        run: |
+          set -e
+
+          SOURCE="source-repos/centrim_api/openwiki"
+          DESTINATION="reference/aiSpecAndTechnicalDocumentationOfUIandAPI/api"
+
+          if [ ! -d "$SOURCE" ]; then
+            echo "ERROR: API OpenWiki folder not found:"
+            echo "$SOURCE"
+            exit 1
+          fi
+
+          echo "Synchronizing API documentation..."
+
+          mkdir -p "$DESTINATION"
+
+          rsync -av --delete \
+            "$SOURCE/" \
+            "$DESTINATION/"
+
+          echo "API documentation synchronized."
+
+      # ==================================================
+      # 5. Synchronize latest UI OpenWiki documentation
+      # ==================================================
+      - name: Sync UI documentation
+        shell: bash
+        run: |
+          set -e
+
+          SOURCE="source-repos/centrim_life/openwiki"
+          DESTINATION="reference/aiSpecAndTechnicalDocumentationOfUIandAPI/ui"
+
+          if [ ! -d "$SOURCE" ]; then
+            echo "ERROR: UI OpenWiki folder not found:"
+            echo "$SOURCE"
+            exit 1
+          fi
+
+          echo "Synchronizing UI documentation..."
+
+          mkdir -p "$DESTINATION"
+
+          rsync -av --delete \
+            "$SOURCE/" \
+            "$DESTINATION/"
+
+          echo "UI documentation synchronized."
+
+      # ==================================================
+      # 6. Show synchronized reference changes
+      # ==================================================
+      - name: Show synchronized documentation
+        run: |
+          echo "=========================================="
+          echo "API reference files"
+          echo "=========================================="
+
+          find \
+            reference/aiSpecAndTechnicalDocumentationOfUIandAPI/api \
+            -type f \
+            | sort
+
+          echo ""
+          echo "=========================================="
+          echo "UI reference files"
+          echo "=========================================="
+
+          find \
+            reference/aiSpecAndTechnicalDocumentationOfUIandAPI/ui \
+            -type f \
+            | sort
+
+          echo ""
+          echo "=========================================="
+          echo "Reference changes"
+          echo "=========================================="
+
+          git status --short \
+            reference/aiSpecAndTechnicalDocumentationOfUIandAPI/
+
+      # ==================================================
+      # 7. Remove temporary copies of API/UI repositories
+      #
+      # Important:
+      # OpenWiki should work on the documentation repo,
+      # not scan the full API/UI source repositories.
+      # ==================================================
+      - name: Remove temporary source repositories
+        run: |
+          rm -rf source-repos
+
+      # ==================================================
+      # 8. Setup Node.js
+      # ==================================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.0"
+
+      # ==================================================
+      # 9. Install OpenWiki 0.4.3
+      # ==================================================
+      - name: Install OpenWiki 0.4.3
+        run: |
+          npm install --global openwiki@0.4.3
+
+          echo "Installed OpenWiki:"
+          npm list --global openwiki --depth=0
+
+      # ==================================================
+      # 10. Authenticate GitHub -> AWS using OIDC
+      # ==================================================
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: centrim-documentation-openwiki
+
+      # ==================================================
+      # 11. Verify AWS identity
+      # ==================================================
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # ==================================================
+      # 12. Test Claude Sonnet 4.6
+      # ==================================================
+      - name: Test Claude Sonnet 4.6
+        run: |
+          echo "Testing Bedrock model: $OPENWIKI_MODEL_ID"
+
+          aws bedrock-runtime converse \
+            --region "$AWS_REGION" \
+            --model-id "$OPENWIKI_MODEL_ID" \
+            --messages '[
+              {
+                "role": "user",
+                "content": [
+                  {
+                    "text": "Reply with exactly: SONNET_4_6_OK"
+                  }
+                ]
+              }
+            ]'
+
+      # ==================================================
+      # 13. Update product documentation
+      # ==================================================
+      - name: Update OpenWiki product documentation
+        shell: bash
+        run: |
+          set -o pipefail
+
+          LOG_FILE="openwiki-run.log"
+
+          echo ""
+          echo "=========================================="
+          echo "Starting product documentation update"
+          echo "=========================================="
+          echo "OpenWiki version : 0.4.3"
+          echo "Provider         : $OPENWIKI_PROVIDER"
+          echo "AWS region       : $BEDROCK_AWS_REGION"
+          echo "Model            : $OPENWIKI_MODEL_ID"
+          echo "Branch           : $GITHUB_REF_NAME"
+          echo "Started          : $(date -u)"
+          echo "=========================================="
+
+          (
+            openwiki code --update --print 2>&1 | tee "$LOG_FILE"
+          ) &
+
+          OPENWIKI_PID=$!
+
+          echo "OpenWiki PID: $OPENWIKI_PID"
+
+          while kill -0 "$OPENWIKI_PID" 2>/dev/null; do
+            sleep 60
+
+            if ! kill -0 "$OPENWIKI_PID" 2>/dev/null; then
+              break
+            fi
+
+            echo ""
+            echo "=========================================="
+            echo "OpenWiki still running"
+            echo "Time: $(date -u)"
+            echo "=========================================="
+
+            if [ -f "openwiki/.run.json" ]; then
+              echo "Current OpenWiki run state:"
+              cat openwiki/.run.json
+            else
+              echo "No .run.json available yet."
+            fi
+
+            echo ""
+            echo "Product documentation changes so far:"
+            git status --short openwiki/ || true
+          done
+
+          set +e
+          wait "$OPENWIKI_PID"
+          OPENWIKI_EXIT=$?
+          set -e
+
+          echo ""
+          echo "=========================================="
+          echo "OpenWiki finished"
+          echo "=========================================="
+          echo "Exit code : $OPENWIKI_EXIT"
+          echo "Finished  : $(date -u)"
+          echo "=========================================="
+
+          if [ "$OPENWIKI_EXIT" -ne 0 ]; then
+            echo "OpenWiki failed."
+            echo ""
+            echo "Last 50 OpenWiki log lines:"
+            tail -50 "$LOG_FILE" || true
+            exit "$OPENWIKI_EXIT"
+          fi
+
+          echo ""
+          echo "Product documentation update completed."
+
+      # ==================================================
+      # 14. Show all final changes
+      # ==================================================
+      - name: Show final documentation changes
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "All changed files"
+          echo "=========================================="
+
+          git status --short
+
+          echo ""
+          echo "=========================================="
+          echo "Product documentation changes"
+          echo "=========================================="
+
+          git diff --name-only -- openwiki/ || true
+
+          echo ""
+          echo "=========================================="
+          echo "API/UI reference changes"
+          echo "=========================================="
+
+          git diff --name-only -- \
+            reference/aiSpecAndTechnicalDocumentationOfUIandAPI/ || true
+
+          echo ""
+
+          if [ -f "openwiki/.last-update.json" ]; then
+            echo "=========================================="
+            echo "Last OpenWiki update metadata"
+            echo "=========================================="
+
+            cat openwiki/.last-update.json
+          fi
+
+      # ==================================================
+      # 15. Commit everything to centrim-documentation
+      # ==================================================
+      - name: Commit documentation changes
+        if: success()
+        shell: bash
+        run: |
+          git config user.name "centrim-openwiki[bot]"
+          git config user.email "centrim-openwiki[bot]@users.noreply.github.com"
+
+          # Product documentation
+          git add openwiki/
+
+          # Latest API and UI technical/AI-spec references
+          git add reference/aiSpecAndTechnicalDocumentationOfUIandAPI/api/
+          git add reference/aiSpecAndTechnicalDocumentationOfUIandAPI/ui/
+
+          if [ -f "AGENTS.md" ]; then
+            git add AGENTS.md
+          fi
+
+          if [ -f "CLAUDE.md" ]; then
+            git add CLAUDE.md
+          fi
+
+          echo ""
+          echo "Files ready to commit:"
+          git diff --cached --name-only
+
+          if git diff --cached --quiet; then
+            echo ""
+            echo "No documentation changes."
+            echo "Nothing to commit."
+          else
+            echo ""
+            echo "Committing documentation update..."
+
+            git commit \
+              -m "docs: monthly product documentation update"
+
+            echo ""
+            echo "Pushing to:"
+            echo "$GITHUB_REF_NAME"
+
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+
+            echo ""
+            echo "Documentation update pushed successfully."
+          fi
